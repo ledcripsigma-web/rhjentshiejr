@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>uxuxx · smooth</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body, html { 
+            width: 100%; 
+            height: 100%; 
+            overflow: hidden; 
+            background: #000; 
+            touch-action: none;
+            position: fixed;
+        }
+        #v { position: absolute; visibility: hidden; }
+        #c { 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            transform: scaleX(-1);
+        }
+        #l { 
+            position: fixed; 
+            top: 0; 
+            left: 0; 
+            width: 100%; 
+            height: 100%; 
+            background: #000; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            z-index: 100; 
+            pointer-events: none;
+        }
+        #t { 
+            position: fixed; 
+            bottom: 10px; 
+            right: 10px; 
+            color: #666; 
+            font-family: monospace; 
+            font-size: 12px; 
+            z-index: 200; 
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        .ld { 
+            width: 40px; 
+            height: 40px; 
+            border: 2px solid #333; 
+            border-top: 2px solid #fff; 
+            border-radius: 50%; 
+            animation: s 0.8s linear infinite; 
+        }
+        @keyframes s { to { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div id="l"><div class="ld"></div></div>
+    <div id="t"></div>
+    <video id="v" playsinline></video>
+    <canvas id="c"></canvas>
+    <script>
+        (function() {
+            const v = document.getElementById('v');
+            const c = document.getElementById('c');
+            const timerEl = document.getElementById('t');
+            const x = c.getContext('2d', { 
+                alpha: false, 
+                desynchronized: true
+            });
+            const l = document.getElementById('l');
+
+            // Состояние
+            let drawings = [];
+            let cur = null;
+            let cur2 = null;
+            let sel = null;
+            let drag = false;
+            let last = { x: 0, y: 0 };
+            let w = 0, h = 0;
+            let scale = 1.2;
+            let offX = 0, offY = 0;
+            
+            // Таймер очистки
+            let clearTimer = 120;
+            let lastClearTime = Date.now();
+            
+            // Ограничители производительности
+            let lastFrameTime = 0;
+            const TARGET_FPS = 30;
+            const FRAME_TIME = 1000 / TARGET_FPS;
+
+            function resize() {
+                w = c.width = window.innerWidth;
+                h = c.height = window.innerHeight;
+                offX = w * 0.05;
+                offY = h * 0.05;
+            }
+            window.addEventListener('resize', resize);
+            resize();
+
+            const HAND_SIZE = 0.7;
+            const mapX = (nx) => (nx - 0.5) * scale * w * HAND_SIZE + w / 2 + offX;
+            const mapY = (ny) => (ny - 0.5) * scale * h * HAND_SIZE + h / 2 + offY;
+            
+            const isInBounds = (x, y) => x >= -100 && x <= w + 100 && y >= -100 && y <= h + 100;
+
+            const isDraw = (lm) => lm[8].y < lm[6].y && lm[12].y > lm[10].y && lm[16].y > lm[14].y && lm[20].y > lm[18].y;
+            const isPinch = (lm) => Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) < 0.055;
+            const isFist = (lm) => lm[8].y > lm[6].y && lm[12].y > lm[10].y && lm[16].y > lm[14].y && lm[20].y > lm[18].y;
+
+            function findDrawing(px, py) {
+                const pad = 75;
+                for (let i = drawings.length - 1; i >= 0; i--) {
+                    const d = drawings[i];
+                    const pts = d.points;
+                    if (!pts) continue;
+                    for (let j = 0; j < pts.length; j++) {
+                        const dx = px - pts[j].x;
+                        const dy = py - pts[j].y;
+                        if (dx * dx + dy * dy < pad * pad) return d;
+                    }
+                }
+                return null;
+            }
+
+            function cleanOutOfBoundsDrawings() {
+                let changed = false;
+                drawings = drawings.filter(d => {
+                    const pts = d.points;
+                    if (!pts || pts.length === 0) return false;
+                    const hasVisible = pts.some(p => isInBounds(p.x, p.y));
+                    if (!hasVisible) changed = true;
+                    return hasVisible;
+                });
+                
+                if (changed) {
+                    if (cur && !drawings.includes(cur)) cur = null;
+                    if (cur2 && !drawings.includes(cur2)) cur2 = null;
+                    if (sel && !drawings.includes(sel)) {
+                        sel = null;
+                        drag = false;
+                    }
+                }
+            }
+
+            function checkAutoClear() {
+                const now = Date.now();
+                const elapsed = Math.floor((now - lastClearTime) / 1000);
+                clearTimer = Math.max(0, 120 - elapsed);
+                
+                if (clearTimer <= 0) {
+                    drawings = [];
+                    cur = null;
+                    cur2 = null;
+                    sel = null;
+                    drag = false;
+                    lastClearTime = now;
+                    clearTimer = 120;
+                }
+                
+                const mins = Math.floor(clearTimer / 60);
+                const secs = clearTimer % 60;
+                timerEl.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+            }
+
+            // Очистка памяти - критически важно!
+            function cleanupMemory() {
+                // Ограничиваем количество рисунков
+                if (drawings.length > 20) {
+                    drawings = drawings.slice(-15);
+                    cur = null;
+                    cur2 = null;
+                    sel = null;
+                    drag = false;
+                }
+                
+                // Ограничиваем точки в рисунках
+                for (let d of drawings) {
+                    if (d.points && d.points.length > 500) {
+                        d.points = d.points.slice(-300);
+                    }
+                }
+            }
+
+            // Предварительно вычисленные массивы для скелета
+            const CONNECTIONS = [
+                [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+                [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
+                [13,17],[17,18],[18,19],[19,20],[0,17]
+            ];
+            const MAIN_POINTS = [0, 4, 8, 12, 16, 20];
+
+            function onResults(r) {
+                const now = performance.now();
+                
+                // Ограничение FPS
+                if (now - lastFrameTime < FRAME_TIME) {
+                    return;
+                }
+                lastFrameTime = now;
+                
+                if (l.style.display !== 'none') l.style.display = 'none';
+                
+                checkAutoClear();
+                
+                // Очистка памяти каждые 5 секунд
+                if (now % 5000 < FRAME_TIME) {
+                    cleanupMemory();
+                }
+                
+                cleanOutOfBoundsDrawings();
+
+                // Очистка фона
+                x.fillStyle = '#000';
+                x.fillRect(0, 0, w, h);
+                
+                // Отрисовка линий
+                x.lineCap = 'round';
+                x.lineJoin = 'round';
+                
+                // Оптимизированная отрисовка
+                const len = drawings.length;
+                for (let i = 0; i < len; i++) {
+                    const d = drawings[i];
+                    const pts = d.points;
+                    if (!pts || pts.length < 2) continue;
+                    
+                    const isSel = sel && sel.id === d.id;
+                    const isSec = d.isSecond;
+                    
+                    if (isSel) {
+                        x.strokeStyle = '#ff0';
+                        x.lineWidth = 8;
+                    } else if (isSec) {
+                        x.strokeStyle = '#0cf';
+                        x.lineWidth = 5;
+                    } else {
+                        x.strokeStyle = '#f66';
+                        x.lineWidth = 5;
+                    }
+                    
+                    x.beginPath();
+                    let first = true;
+                    for (let j = 0; j < pts.length; j++) {
+                        const pt = pts[j];
+                        if (first) {
+                            x.moveTo(pt.x, pt.y);
+                            first = false;
+                        } else {
+                            x.lineTo(pt.x, pt.y);
+                        }
+                    }
+                    x.stroke();
+                }
+
+                const hands = r.multiHandLandmarks;
+                if (!hands || !hands.length) {
+                    cur = cur2 = null;
+                    drag = false;
+                    sel = null;
+                    return;
+                }
+
+                // Обработка рук
+                for (let i = 0; i < hands.length; i++) {
+                    const lm = hands[i];
+                    const hd = r.multiHandedness[i].label;
+
+                    const ix = mapX(lm[8].x);
+                    const iy = mapY(lm[8].y);
+                    const tx = mapX(lm[4].x);
+                    const ty = mapY(lm[4].y);
+                    const mx = (ix + tx) * 0.5;
+                    const my = (iy + ty) * 0.5;
+                    const palmX = mapX(lm[0].x);
+                    const palmY = mapY(lm[0].y);
+
+                    const handVisible = isInBounds(palmX, palmY);
+
+                    if (!handVisible) continue;
+
+                    // Первая рука
+                    if (i === 0) {
+                        if (isDraw(lm)) {
+                            if (!cur) {
+                                cur = { points: [], id: Date.now() + Math.random() };
+                                drawings.push(cur);
+                            }
+                            if (isInBounds(ix, iy)) {
+                                cur.points.push({ x: ix, y: iy });
+                                // Ограничение длины массива
+                                if (cur.points.length > 300) {
+                                    cur.points = cur.points.slice(-200);
+                                }
+                            }
+                            drag = false;
+                            sel = null;
+                        } else if (isPinch(lm) || isFist(lm)) {
+                            if (!drag) {
+                                sel = findDrawing(mx, my) || findDrawing(palmX, palmY);
+                                if (sel) {
+                                    drag = true;
+                                    last.x = isPinch(lm) ? mx : palmX;
+                                    last.y = isPinch(lm) ? my : palmY;
+                                }
+                            }
+                            if (drag && sel && sel.points) {
+                                let curX = isPinch(lm) ? mx : palmX;
+                                let curY = isPinch(lm) ? my : palmY;
+                                const dx2 = curX - last.x;
+                                const dy2 = curY - last.y;
+                                const pts = sel.points;
+                                for (let j = 0; j < pts.length; j++) {
+                                    pts[j].x += dx2;
+                                    pts[j].y += dy2;
+                                }
+                                last.x = curX;
+                                last.y = curY;
+                            }
+                            cur = null;
+                        } else {
+                            cur = null;
+                            drag = false;
+                            sel = null;
+                        }
+                    }
+
+                    // Вторая рука
+                    if (i === 1) {
+                        if (isDraw(lm)) {
+                            if (!cur2) {
+                                cur2 = { points: [], id: Date.now() + Math.random() + 1, isSecond: true };
+                                drawings.push(cur2);
+                            }
+                            if (isInBounds(ix, iy)) {
+                                cur2.points.push({ x: ix, y: iy });
+                                if (cur2.points.length > 300) {
+                                    cur2.points = cur2.points.slice(-200);
+                                }
+                            }
+                        } else {
+                            cur2 = null;
+                        }
+                    }
+
+                    // Отрисовка скелета
+                    const color = hd === 'Left' ? '#ccc' : '#fff';
+                    x.strokeStyle = color;
+                    x.lineWidth = 3;
+                    x.fillStyle = color;
+
+                    // Соединения
+                    for (let j = 0; j < CONNECTIONS.length; j++) {
+                        const conn = CONNECTIONS[j];
+                        const a = lm[conn[0]];
+                        const b = lm[conn[1]];
+                        const ax = mapX(a.x);
+                        const ay = mapY(a.y);
+                        const bx = mapX(b.x);
+                        const by = mapY(b.y);
+                        
+                        if (isInBounds(ax, ay) || isInBounds(bx, by)) {
+                            x.beginPath();
+                            x.moveTo(ax, ay);
+                            x.lineTo(bx, by);
+                            x.stroke();
+                        }
+                    }
+
+                    // Основные точки
+                    for (let j = 0; j < MAIN_POINTS.length; j++) {
+                        const pt = lm[MAIN_POINTS[j]];
+                        const px = mapX(pt.x);
+                        const py = mapY(pt.y);
+                        if (isInBounds(px, py)) {
+                            x.beginPath();
+                            x.arc(px, py, 3, 0, 6.28);
+                            x.fill();
+                        }
+                    }
+                }
+            }
+
+            const hands = new Hands({
+                locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+            });
+
+            hands.setOptions({
+                maxNumHands: 2,
+                modelComplexity: 0,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.4
+            });
+
+            hands.onResults(onResults);
+
+            const cam = new Camera(v, {
+                onFrame: async () => {
+                    if (!v.paused && !v.ended && v.readyState >= 2) {
+                        await hands.send({ image: v });
+                    }
+                },
+                width: 320,
+                height: 240
+            });
+            
+            cam.start().then(() => {
+                setTimeout(() => {
+                    if (l.style.display !== 'none') {
+                        l.style.opacity = '0';
+                        setTimeout(() => l.style.display = 'none', 300);
+                    }
+                }, 500);
+            }).catch(e => console.log('Camera error:', e));
+            
+            c.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+            c.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+            
+            // Принудительная очистка памяти
+            setInterval(() => {
+                cleanupMemory();
+                // Принудительный сбор мусора (подсказка браузеру)
+                if (drawings.length > 30) {
+                    drawings.length = 20;
+                }
+            }, 5000);
+        })();
+    </script>
+</body>
+</html>
+
+
+перевели этот код в java чтобы был один в один прям
